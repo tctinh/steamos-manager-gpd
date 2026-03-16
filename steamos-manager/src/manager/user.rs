@@ -1926,6 +1926,7 @@ mod test {
                 download_mode_limit: NonZeroU32::new(6),
                 firmware_attribute: None,
                 performance_profile: None,
+                acpi_call_alib: None,
             }),
             fan_speed: Some(FanSpeedConfig {
                 hwmon: String::from("steamdeck_hwmon"),
@@ -3149,6 +3150,7 @@ mod test {
             download_mode_limit: Some(NonZero::new(5).unwrap()),
             firmware_attribute: None,
             performance_profile: None,
+            acpi_call_alib: None,
         });
         let mut test = start(TestConfig {
             platform: None,
