@@ -1,7 +1,7 @@
 # Maintainer: tctinh
 # steamos-manager with native TDP control for GPD Win Mini (ACPI/ALIB)
 
-pkgname=steamos-manager
+pkgname=steamos-manager-gpdwinmini
 pkgver=26.0.1
 pkgrel=2
 pkgdesc="SteamOS Manager with native ACPI/ALIB TDP control for GPD Win Mini"

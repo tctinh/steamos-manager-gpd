@@ -1816,9 +1816,9 @@ mod test {
     use crate::gpu::{GpuPerformanceLevelDriverType, GpuPowerProfileDriverType};
     use crate::hardware::test::fake_model;
     use crate::hardware::{
-        BatteryChargeLimitConfig, DeviceConfig, DeviceMatch, DmiMatch, FanSpeedConfig,
-        GpuPerformanceConfig, GpuPowerProfileConfig, PerformanceProfileConfig, RangeConfig,
-        SteamDeckVariant, TdpLimitConfig,
+        AcpiCallAlibConfig, BatteryChargeLimitConfig, DeviceConfig, DeviceMatch, DmiMatch,
+        FanSpeedConfig, GpuPerformanceConfig, GpuPowerProfileConfig, PerformanceProfileConfig,
+        RangeConfig, SteamDeckVariant, TdpLimitConfig,
     };
     use crate::platform::{
         FormatDeviceConfig, PlatformConfig, ResetConfig, ScriptConfig, ServiceConfig, StorageConfig,
@@ -3051,6 +3051,18 @@ mod test {
         }
     }
 
+    struct MockRootManager {
+        limit: u32,
+    }
+
+    #[interface(name = "com.steampowered.SteamOSManager1.RootManager")]
+    impl MockRootManager {
+        async fn set_tdp_limit(&mut self, limit: u32) -> fdo::Result<()> {
+            self.limit = limit;
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn remote_tdp_limit1_autoadd() {
         let mut test = start(TestConfig::only_setup(RemoteSetup::new("TdpLimit1", 1)))
@@ -3201,6 +3213,79 @@ mod test {
         sleep(Duration::from_millis(10)).await;
         assert_eq!(proxy.tdp_limit().await.unwrap(), 10);
         assert_eq!(remote.get().await.limit, 10);
+
+        service.abort();
+    }
+
+    #[tokio::test]
+    async fn acpi_call_alib_tdp_limit_reports_last_set_value() {
+        let mut device = DeviceConfig::default();
+        device.tdp_limit = Some(TdpLimitConfig {
+            method: TdpLimitingMethod::AcpiCallAlib,
+            range: Some(RangeConfig { min: 4, max: 28 }),
+            download_mode_limit: None,
+            firmware_attribute: None,
+            performance_profile: None,
+            acpi_call_alib: Some(AcpiCallAlibConfig {
+                alib_method: String::from(r"\_SB.ALIB"),
+                stapm_limit_id: 0x05,
+                fast_limit_id: 0x06,
+                slow_limit_id: 0x07,
+                slow_time_id: 0x08,
+                stapm_time_id: 0x01,
+                temp_target_id: 0x03,
+                skin_limit_id: 0x2e,
+                power_scale: 1000,
+                time_scale: 1,
+                temp_scale: 1,
+                slow_time: 10,
+                stapm_time: 100,
+                temp_target: 85,
+            }),
+        });
+        let mut test = start(TestConfig {
+            platform: None,
+            device: Some(device),
+            setup: NopTestSetup::default(),
+        })
+        .await
+        .unwrap();
+
+        let acpi_call_path = path("proc/acpi/call");
+        let parent = acpi_call_path.parent().unwrap();
+        create_dir_all(parent).await.unwrap();
+        write(&acpi_call_path, "").await.unwrap();
+
+        test.connection
+            .request_name("com.steampowered.SteamOSManager1")
+            .await
+            .unwrap();
+        test.connection
+            .object_server()
+            .at(
+                "/com/steampowered/SteamOSManager1",
+                MockRootManager { limit: 0 },
+            )
+            .await
+            .unwrap();
+
+        let service = setup_tdp_manager(&mut test).await.unwrap();
+        let new_conn = test.handle.new_connection().await.unwrap();
+        test_remote_interface_added::<TdpLimit1, _>(&test, &new_conn)
+            .await
+            .unwrap();
+
+        let proxy = TdpLimit1Proxy::builder(&new_conn)
+            .destination(test.connection.unique_name().unwrap())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(proxy.tdp_limit().await.unwrap(), 4);
+        proxy.set_tdp_limit(15).await.unwrap();
+        sleep(Duration::from_millis(5)).await;
+        assert_eq!(proxy.tdp_limit().await.unwrap(), 15);
 
         service.abort();
     }

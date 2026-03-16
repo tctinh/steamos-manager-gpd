@@ -38,11 +38,7 @@ install: target/release/steamos-manager target/release/steamosctl
 	install -m644 "data/system/com.steampowered.SteamOSManager1.service" "$(DESTDIR)/usr/share/dbus-1/system-services/"
 	install -m644 "data/system/com.steampowered.SteamOSManager1.conf" "$(DESTDIR)/usr/share/dbus-1/system.d/"
 	install -m644 "data/system/steamos-manager.service" "$(DESTDIR)/usr/lib/systemd/system/"
-	install -m644 "data/system/steamos-manager-acpi-call.service" "$(DESTDIR)/usr/lib/systemd/system/"
 	install -m644 "data/system/reset-oneshot-boot.conf" "$(DESTDIR)/usr/lib/systemd/system/sddm.service.d/"
-
-	install -d -m0755 "$(DESTDIR)/usr/lib/modules-load.d/"
-	install -m644 "data/system/acpi-call.conf" "$(DESTDIR)/usr/lib/modules-load.d/"
 
 	install -m644 "data/user/com.steampowered.SteamOSManager1.service" "$(DESTDIR)/usr/share/dbus-1/services/"
 	install -m644 "data/user/steamos-manager.service" "$(DESTDIR)/usr/lib/systemd/user/"

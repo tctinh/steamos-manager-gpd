@@ -16,6 +16,7 @@ use std::ops::RangeInclusive;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
 use strum::{Display, EnumIter, EnumString, VariantNames};
 use tokio::fs::{self, File, read_dir, read_to_string, try_exists};
 use tokio::io::{AsyncWriteExt, ErrorKind, Interest};
@@ -146,6 +147,7 @@ pub(crate) struct FirmwareAttributeLimitManager {
 #[derive(Debug)]
 pub(crate) struct AcpiCallAlibTdpLimitManager {
     config: AcpiCallAlibConfig,
+    cached_limit: Mutex<u32>,
 }
 
 #[derive(Debug)]
@@ -159,6 +161,8 @@ pub(crate) trait TdpLimitManager: Send + Sync {
     async fn get_tdp_limit(&self) -> Result<u32>;
     async fn set_tdp_limit(&self, limit: u32) -> Result<()>;
     async fn get_tdp_limit_range(&self) -> Result<RangeInclusive<u32>>;
+
+    fn record_applied_tdp_limit(&self, _limit: u32) {}
 
     async fn is_active(&self) -> Result<bool> {
         Ok(true)
@@ -197,8 +201,12 @@ pub(crate) async fn tdp_limit_manager(system: &Connection) -> Result<Box<dyn Tdp
                 let Some(ref acpi_call_alib) = config.acpi_call_alib else {
                     bail!("ACPI call ALIB TDP limiting method not configured");
                 };
+                let range = config
+                    .range
+                    .ok_or(anyhow!("No TDP limit range configured"))?;
                 Box::new(AcpiCallAlibTdpLimitManager {
                     config: acpi_call_alib.clone(),
+                    cached_limit: Mutex::new(range.min),
                 })
             }
         })
@@ -572,7 +580,7 @@ impl TdpLimitManager for AmdgpuHwmonTdpLimitManager {
 #[async_trait]
 impl TdpLimitManager for AcpiCallAlibTdpLimitManager {
     async fn get_tdp_limit(&self) -> Result<u32> {
-        bail!("Current TDP readback is not supported for acpi_call_alib")
+        Ok(*self.cached_limit.lock().unwrap())
     }
 
     async fn set_tdp_limit(&self, limit: u32) -> Result<()> {
@@ -584,7 +592,9 @@ impl TdpLimitManager for AcpiCallAlibTdpLimitManager {
 
         let payload = build_acpi_call_alib_payload(&self.config, limit)?;
         let command = build_acpi_call_command(&self.config.alib_method, &payload);
-        write_synced(path(ACPI_CALL_PATH), command.as_bytes()).await
+        write_synced(path(ACPI_CALL_PATH), command.as_bytes()).await?;
+        *self.cached_limit.lock().unwrap() = limit;
+        Ok(())
     }
 
     async fn get_tdp_limit_range(&self) -> Result<RangeInclusive<u32>> {
@@ -600,17 +610,12 @@ impl TdpLimitManager for AcpiCallAlibTdpLimitManager {
         bail!("No TDP limit range configured");
     }
 
+    fn record_applied_tdp_limit(&self, limit: u32) {
+        *self.cached_limit.lock().unwrap() = limit;
+    }
+
     async fn is_active(&self) -> Result<bool> {
-        match fs::OpenOptions::new()
-            .write(true)
-            .open(path(ACPI_CALL_PATH))
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+        Ok(try_exists(path(ACPI_CALL_PATH)).await?)
     }
 }
 
@@ -1038,6 +1043,7 @@ impl TdpManagerService {
                 .set_tdp_limit(limit)
                 .await
                 .inspect_err(|e| error!("Failed to set TDP limit: {e}"))?;
+            self.manager.record_applied_tdp_limit(limit);
         } else {
             self.manager.set_tdp_limit(limit).await?;
         }
@@ -2197,6 +2203,27 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
+    async fn test_acpi_call_alib_get_tdp_limit_uses_initial_cached_minimum() {
+        let mut handle = testing::start();
+        let connection = handle.new_dbus().await.expect("new_dbus");
+
+        let mut config = DeviceConfig::default();
+        config.tdp_limit = Some(TdpLimitConfig {
+            method: TdpLimitingMethod::AcpiCallAlib,
+            range: Some(RangeConfig { min: 4, max: 28 }),
+            download_mode_limit: None,
+            firmware_attribute: None,
+            performance_profile: None,
+            acpi_call_alib: Some(gpd_acpi_call_alib_config()),
+        });
+        handle.test.set_device_config(config).await;
+
+        let manager = tdp_limit_manager(&connection).await.unwrap();
+
+        assert_eq!(manager.get_tdp_limit().await.unwrap(), 4);
+    }
+
+    #[tokio::test]
     async fn test_acpi_call_alib_set_tdp_limit() {
         let mut handle = testing::start();
         let connection = handle.new_dbus().await.expect("new_dbus");
@@ -2220,7 +2247,9 @@ pub(crate) mod test {
         write(&acpi_call_path, "").await.unwrap();
 
         assert!(manager.is_active().await.unwrap());
+        assert_eq!(manager.get_tdp_limit().await.unwrap(), 4);
         manager.set_tdp_limit(15).await.unwrap();
+        assert_eq!(manager.get_tdp_limit().await.unwrap(), 15);
 
         assert_eq!(
             read_to_string(acpi_call_path).await.unwrap(),
