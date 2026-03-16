@@ -16,6 +16,7 @@ use std::ops::RangeInclusive;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
 use strum::{Display, EnumIter, EnumString, VariantNames};
 use tokio::fs::{self, File, read_dir, read_to_string, try_exists};
 use tokio::io::{AsyncWriteExt, ErrorKind, Interest};
@@ -30,7 +31,7 @@ use zbus::{Connection, ObjectServer, fdo};
 
 use crate::error::{to_zbus_error, to_zbus_fdo_error};
 use crate::gpu::AMDGPU_HWMON_NAME;
-use crate::hardware::{FanControlState, device_config};
+use crate::hardware::{AcpiCallAlibConfig, FanControlState, device_config};
 use crate::manager::MANAGER_PATH;
 use crate::manager::root::RootManagerProxy;
 use crate::manager::user::TdpLimit1;
@@ -67,6 +68,11 @@ const SB_PATH: &str = "/sys/bus/acpi/drivers/battery/PNP0C0A:00/power_supply";
 const SB_PATH: &str = "power_supply";
 pub const BATTERY_DEFAULT_SUGGESTED_MINIMUM_LIMIT: i32 = 10;
 const SB_LIMIT_PATH: &str = "charge_control_end_threshold";
+
+#[cfg(not(test))]
+const ACPI_CALL_PATH: &str = "/proc/acpi/call";
+#[cfg(test)]
+const ACPI_CALL_PATH: &str = "proc/acpi/call";
 
 #[derive(Display, EnumString, Hash, Eq, PartialEq, Debug, Copy, Clone)]
 #[strum(serialize_all = "lowercase")]
@@ -124,6 +130,7 @@ pub enum TdpLimitingMethod {
     AmdgpuHwmon,
     FirmwareAttribute,
     RemoteInterface,
+    AcpiCallAlib,
 }
 
 #[derive(Debug)]
@@ -138,6 +145,12 @@ pub(crate) struct FirmwareAttributeLimitManager {
 }
 
 #[derive(Debug)]
+pub(crate) struct AcpiCallAlibTdpLimitManager {
+    config: AcpiCallAlibConfig,
+    cached_limit: Mutex<u32>,
+}
+
+#[derive(Debug)]
 pub(crate) struct RemoteInterfaceLimitManager<'proxy> {
     connection: Connection,
     proxy: Option<TdpLimit1Proxy<'proxy>>,
@@ -148,6 +161,8 @@ pub(crate) trait TdpLimitManager: Send + Sync {
     async fn get_tdp_limit(&self) -> Result<u32>;
     async fn set_tdp_limit(&self, limit: u32) -> Result<()>;
     async fn get_tdp_limit_range(&self) -> Result<RangeInclusive<u32>>;
+
+    fn record_applied_tdp_limit(&self, _limit: u32) {}
 
     async fn is_active(&self) -> Result<bool> {
         Ok(true)
@@ -182,6 +197,18 @@ pub(crate) async fn tdp_limit_manager(system: &Connection) -> Result<Box<dyn Tdp
                 connection: system.clone(),
                 proxy: None,
             }),
+            TdpLimitingMethod::AcpiCallAlib => {
+                let Some(ref acpi_call_alib) = config.acpi_call_alib else {
+                    bail!("ACPI call ALIB TDP limiting method not configured");
+                };
+                let range = config
+                    .range
+                    .ok_or(anyhow!("No TDP limit range configured"))?;
+                Box::new(AcpiCallAlibTdpLimitManager {
+                    config: acpi_call_alib.clone(),
+                    cached_limit: Mutex::new(range.min),
+                })
+            }
         })
     } else {
         Ok(Box::new(RemoteInterfaceLimitManager {
@@ -441,6 +468,50 @@ async fn find_platform_profile(name: &str) -> Result<PathBuf> {
     find_sysdir(path(PLATFORM_PROFILE_PREFIX), name).await
 }
 
+fn append_alib_param(payload: &mut Vec<u8>, param: u8, value: u32) {
+    payload.push(param);
+    payload.extend_from_slice(&value.to_le_bytes());
+}
+
+fn build_acpi_call_alib_payload(config: &AcpiCallAlibConfig, limit: u32) -> Result<Vec<u8>> {
+    let power_value = limit
+        .checked_mul(config.power_scale)
+        .ok_or(anyhow!("ALIB power scaling overflow"))?;
+    let slow_time = config
+        .slow_time
+        .checked_mul(config.time_scale)
+        .ok_or(anyhow!("ALIB slow time scaling overflow"))?;
+    let stapm_time = config
+        .stapm_time
+        .checked_mul(config.time_scale)
+        .ok_or(anyhow!("ALIB STAPM time scaling overflow"))?;
+    let temp_target = config
+        .temp_target
+        .checked_mul(config.temp_scale)
+        .ok_or(anyhow!("ALIB temperature scaling overflow"))?;
+
+    let mut payload = Vec::with_capacity(2 + (7 * 5));
+    payload.extend_from_slice(&(2u16 + (7 * 5) as u16).to_le_bytes());
+    append_alib_param(&mut payload, config.stapm_limit_id, power_value);
+    append_alib_param(&mut payload, config.fast_limit_id, power_value);
+    append_alib_param(&mut payload, config.slow_limit_id, power_value);
+    append_alib_param(&mut payload, config.slow_time_id, slow_time);
+    append_alib_param(&mut payload, config.stapm_time_id, stapm_time);
+    append_alib_param(&mut payload, config.temp_target_id, temp_target);
+    append_alib_param(&mut payload, config.skin_limit_id, power_value);
+    Ok(payload)
+}
+
+fn build_acpi_call_command(method: &str, payload: &[u8]) -> String {
+    format!(
+        "{method} 0x0c b{}",
+        payload
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
+
 #[async_trait]
 impl TdpLimitManager for AmdgpuHwmonTdpLimitManager {
     async fn get_tdp_limit(&self) -> Result<u32> {
@@ -503,6 +574,48 @@ impl TdpLimitManager for AmdgpuHwmonTdpLimitManager {
         } else {
             Ok(true)
         }
+    }
+}
+
+#[async_trait]
+impl TdpLimitManager for AcpiCallAlibTdpLimitManager {
+    async fn get_tdp_limit(&self) -> Result<u32> {
+        Ok(*self.cached_limit.lock().unwrap())
+    }
+
+    async fn set_tdp_limit(&self, limit: u32) -> Result<()> {
+        ensure!(self.is_active().await?, "TDP limiting not active");
+        ensure!(
+            self.get_tdp_limit_range().await?.contains(&limit),
+            "Invalid limit"
+        );
+
+        let payload = build_acpi_call_alib_payload(&self.config, limit)?;
+        let command = build_acpi_call_command(&self.config.alib_method, &payload);
+        write_synced(path(ACPI_CALL_PATH), command.as_bytes()).await?;
+        *self.cached_limit.lock().unwrap() = limit;
+        Ok(())
+    }
+
+    async fn get_tdp_limit_range(&self) -> Result<RangeInclusive<u32>> {
+        let config = device_config().await?;
+        let config = config
+            .as_ref()
+            .and_then(|config| config.tdp_limit.as_ref())
+            .ok_or(anyhow!("No TDP limit configured"))?;
+
+        if let Some(range) = config.range {
+            return Ok(range.min..=range.max);
+        }
+        bail!("No TDP limit range configured");
+    }
+
+    fn record_applied_tdp_limit(&self, limit: u32) {
+        *self.cached_limit.lock().unwrap() = limit;
+    }
+
+    async fn is_active(&self) -> Result<bool> {
+        Ok(try_exists(path(ACPI_CALL_PATH)).await?)
     }
 }
 
@@ -930,6 +1043,7 @@ impl TdpManagerService {
                 .set_tdp_limit(limit)
                 .await
                 .inspect_err(|e| error!("Failed to set TDP limit: {e}"))?;
+            self.manager.record_applied_tdp_limit(limit);
         } else {
             self.manager.set_tdp_limit(limit).await?;
         }
@@ -1108,6 +1222,7 @@ pub(crate) mod test {
             download_mode_limit: None,
             firmware_attribute: None,
             performance_profile: None,
+            acpi_call_alib: None,
         });
         handle.test.set_device_config(config).await;
         let manager = tdp_limit_manager(&connection).await.unwrap();
@@ -1135,6 +1250,7 @@ pub(crate) mod test {
             download_mode_limit: None,
             firmware_attribute: None,
             performance_profile: None,
+            acpi_call_alib: None,
         });
         handle.test.set_device_config(config).await;
         let manager = tdp_limit_manager(&connection).await.unwrap();
@@ -1567,6 +1683,7 @@ pub(crate) mod test {
             download_mode_limit: NonZeroU32::new(6),
             firmware_attribute: None,
             performance_profile: None,
+            acpi_call_alib: None,
         });
         h.test.set_device_config(config).await;
         let manager = tdp_limit_manager(&connection).await.unwrap();
@@ -1669,6 +1786,7 @@ pub(crate) mod test {
             download_mode_limit: NonZeroU32::new(6),
             firmware_attribute: None,
             performance_profile: None,
+            acpi_call_alib: None,
         });
         config.fan_speed = Some(FanSpeedConfig {
             hwmon: String::from("steamdeck_hwmon"),
@@ -1749,6 +1867,7 @@ pub(crate) mod test {
             download_mode_limit: None,
             firmware_attribute: None,
             performance_profile: None,
+            acpi_call_alib: None,
         });
         h.test.set_device_config(config).await;
         let manager = tdp_limit_manager(&connection).await.unwrap();
@@ -1820,6 +1939,7 @@ pub(crate) mod test {
                 performance_profile: Some(String::from("custom")),
             }),
             performance_profile: None,
+            acpi_call_alib: None,
         });
         h.test.set_device_config(config).await;
 
@@ -1940,6 +2060,7 @@ pub(crate) mod test {
                 performance_profile: None,
             }),
             performance_profile: None,
+            acpi_call_alib: None,
         });
         h.test.set_device_config(config).await;
 
@@ -2027,5 +2148,131 @@ pub(crate) mod test {
 
         manager.set_tdp_limit(2).await.unwrap_err();
         assert_eq!(manager.get_tdp_limit().await.unwrap(), 7);
+    }
+
+    fn gpd_acpi_call_alib_config() -> AcpiCallAlibConfig {
+        AcpiCallAlibConfig {
+            alib_method: String::from(r"\_SB.ALIB"),
+            stapm_limit_id: 0x05,
+            fast_limit_id: 0x06,
+            slow_limit_id: 0x07,
+            slow_time_id: 0x08,
+            stapm_time_id: 0x01,
+            temp_target_id: 0x03,
+            skin_limit_id: 0x2e,
+            power_scale: 1000,
+            time_scale: 1,
+            temp_scale: 1,
+            slow_time: 10,
+            stapm_time: 100,
+            temp_target: 85,
+        }
+    }
+
+    #[test]
+    fn test_acpi_call_alib_payload_encoding() {
+        let payload = build_acpi_call_alib_payload(&gpd_acpi_call_alib_config(), 15).unwrap();
+        assert_eq!(
+            payload,
+            vec![
+                0x25, 0x00, 0x05, 0x98, 0x3a, 0x00, 0x00, 0x06, 0x98, 0x3a, 0x00, 0x00, 0x07,
+                0x98, 0x3a, 0x00, 0x00, 0x08, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x00,
+                0x00, 0x03, 0x55, 0x00, 0x00, 0x00, 0x2e, 0x98, 0x3a, 0x00, 0x00,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acpi_call_alib_tdp_manager_inactive_without_acpi_node() {
+        let mut handle = testing::start();
+        let connection = handle.new_dbus().await.expect("new_dbus");
+
+        let mut config = DeviceConfig::default();
+        config.tdp_limit = Some(TdpLimitConfig {
+            method: TdpLimitingMethod::AcpiCallAlib,
+            range: Some(RangeConfig { min: 4, max: 28 }),
+            download_mode_limit: None,
+            firmware_attribute: None,
+            performance_profile: None,
+            acpi_call_alib: Some(gpd_acpi_call_alib_config()),
+        });
+        handle.test.set_device_config(config).await;
+
+        let manager = tdp_limit_manager(&connection).await.unwrap();
+        assert!(!manager.is_active().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_acpi_call_alib_get_tdp_limit_uses_initial_cached_minimum() {
+        let mut handle = testing::start();
+        let connection = handle.new_dbus().await.expect("new_dbus");
+
+        let mut config = DeviceConfig::default();
+        config.tdp_limit = Some(TdpLimitConfig {
+            method: TdpLimitingMethod::AcpiCallAlib,
+            range: Some(RangeConfig { min: 4, max: 28 }),
+            download_mode_limit: None,
+            firmware_attribute: None,
+            performance_profile: None,
+            acpi_call_alib: Some(gpd_acpi_call_alib_config()),
+        });
+        handle.test.set_device_config(config).await;
+
+        let manager = tdp_limit_manager(&connection).await.unwrap();
+
+        assert_eq!(manager.get_tdp_limit().await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_acpi_call_alib_set_tdp_limit() {
+        let mut handle = testing::start();
+        let connection = handle.new_dbus().await.expect("new_dbus");
+
+        let mut config = DeviceConfig::default();
+        config.tdp_limit = Some(TdpLimitConfig {
+            method: TdpLimitingMethod::AcpiCallAlib,
+            range: Some(RangeConfig { min: 4, max: 28 }),
+            download_mode_limit: None,
+            firmware_attribute: None,
+            performance_profile: None,
+            acpi_call_alib: Some(gpd_acpi_call_alib_config()),
+        });
+        handle.test.set_device_config(config).await;
+
+        let manager = tdp_limit_manager(&connection).await.unwrap();
+
+        let acpi_call_path = path(ACPI_CALL_PATH);
+        let parent = acpi_call_path.parent().unwrap();
+        create_dir_all(parent).await.unwrap();
+        write(&acpi_call_path, "").await.unwrap();
+
+        assert!(manager.is_active().await.unwrap());
+        assert_eq!(manager.get_tdp_limit().await.unwrap(), 4);
+        manager.set_tdp_limit(15).await.unwrap();
+        assert_eq!(manager.get_tdp_limit().await.unwrap(), 15);
+
+        assert_eq!(
+            read_to_string(acpi_call_path).await.unwrap(),
+            String::from(r"\_SB.ALIB 0x0c b250005983a000006983a000007983a0000080a000000016400000003550000002e983a0000")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acpi_call_alib_factory_fails_without_config() {
+        let mut handle = testing::start();
+        let connection = handle.new_dbus().await.expect("new_dbus");
+
+        let mut config = DeviceConfig::default();
+        config.tdp_limit = Some(TdpLimitConfig {
+            method: TdpLimitingMethod::AcpiCallAlib,
+            range: Some(RangeConfig { min: 4, max: 28 }),
+            download_mode_limit: None,
+            firmware_attribute: None,
+            performance_profile: None,
+            acpi_call_alib: None,
+        });
+        handle.test.set_device_config(config).await;
+
+        assert!(tdp_limit_manager(&connection).await.is_err());
     }
 }
