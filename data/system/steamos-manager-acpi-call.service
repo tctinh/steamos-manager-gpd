@@ -1,0 +1,12 @@
+[Unit]
+Description=Set permissions on /proc/acpi/call for TDP control
+After=systemd-modules-load.service
+ConditionPathExists=/proc/acpi/call
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/chmod 0666 /proc/acpi/call
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
