@@ -927,33 +927,4 @@ pub mod test {
         assert_eq!(range.max, 28);
         assert!(tdp.acpi_call_alib.is_some());
     }
-
-    #[tokio::test]
-    async fn board_lookup_gpd_win_mini_2024() {
-        let _h = setup_board("GPD\n", "INVALID\n", "G1617-02\n")
-            .await
-            .unwrap();
-        assert_eq!(
-            steam_deck_variant().await.unwrap(),
-            SteamDeckVariant::Unknown
-        );
-        assert_eq!(
-            device_variant().await.unwrap(),
-            (String::from("gpd_win_mini"), String::from("G1617-02"))
-        );
-    }
-
-    #[tokio::test]
-    async fn board_lookup_gpd_win_mini_2024_has_native_tdp_config() {
-        let _h = setup_board("GPD\n", "INVALID\n", "G1617-02\n")
-            .await
-            .unwrap();
-        let config = device_config().await.unwrap().unwrap();
-        let tdp = config.tdp_limit.expect("tdp_limit");
-        assert_eq!(tdp.method, crate::power::TdpLimitingMethod::AcpiCallAlib);
-        let range = tdp.range.unwrap();
-        assert_eq!(range.min, 4);
-        assert_eq!(range.max, 28);
-        assert!(tdp.acpi_call_alib.is_some());
-    }
 }
