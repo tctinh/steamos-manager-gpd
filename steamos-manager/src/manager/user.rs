@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::fs::try_exists;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::{JoinHandle, spawn};
@@ -28,7 +29,7 @@ use zbus::{Connection, ObjectServer, Proxy, interface, zvariant};
 use steamos_manager_macros::{RemoteManager, remote};
 
 use crate::audio::{AudioManager, Mode};
-use crate::cec::{HdmiCecControl, HdmiCecState};
+use crate::cec::{CecdService, HdmiCecControl, HdmiCecState};
 use crate::daemon::DaemonCommand;
 use crate::daemon::user::Command;
 use crate::error::{to_zbus_error, to_zbus_fdo_error, zbus_to_zbus_fdo};
@@ -443,7 +444,7 @@ impl CpuScheduler1 {
             debug!("set CpuScheduler: discarding out of order serial");
             return Ok(());
         }
-        let _: () = self.proxy.call("SetCpuScheduler", &(scheduler)).await?;
+        let _: () = setter!(self, "CpuScheduler", scheduler)?;
         Ok(self.cpu_scheduler_changed(&ctx).await?)
     }
 }
@@ -1475,6 +1476,7 @@ impl Service for ScreenReaderSetupService {
                     let _ = object_server.remove::<ScreenReader0, _>(MANAGER_PATH).await;
                     let _ = object_server.remove::<ScreenReader1, _>(MANAGER_PATH).await;
                 }
+                Err(RecvError::Closed) => return Ok(()),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -1617,17 +1619,20 @@ async fn create_device_interfaces(
     Ok(())
 }
 
+pub(crate) struct UserServices {
+    pub signal_relay: SignalRelayService,
+    pub session_manager: Option<SessionManagerService>,
+    pub screenreader_setup: Option<ScreenReaderSetupService>,
+    pub cecd: Result<CecdService>,
+}
+
 pub(crate) async fn create_interfaces(
     session: Connection,
     system: Connection,
     daemon: Sender<Command>,
     job_manager: UnboundedSender<JobManagerCommand>,
     tdp_manager: Option<UnboundedSender<TdpManagerCommand>>,
-) -> Result<(
-    SignalRelayService,
-    Option<SessionManagerService>,
-    Option<ScreenReaderSetupService>,
-)> {
+) -> Result<UserServices> {
     let proxy = Builder::<Proxy>::new(&system)
         .destination("com.steampowered.SteamOSManager1")?
         .path("/com/steampowered/SteamOSManager1")?
@@ -1657,7 +1662,10 @@ pub(crate) async fn create_interfaces(
         proxy: proxy.clone(),
         order: SerialOrderValidator::default(),
     };
+
     let hdmi_cec = HdmiCec1::new(&session).await?;
+    let cecd_service = CecdService::new(&system, &hdmi_cec.hdmi_cec).await;
+
     let manager2 = Manager2 {
         proxy: proxy.clone(),
         channel: daemon.clone(),
@@ -1798,14 +1806,15 @@ pub(crate) async fn create_interfaces(
     remote_interface.configure(&remote_config).await?;
     object_server.at(MANAGER_PATH, remote_interface).await?;
 
-    Ok((
-        SignalRelayService {
+    Ok(UserServices {
+        signal_relay: SignalRelayService {
             proxy,
             session: session.clone(),
         },
-        session_manager_service,
-        screenreader_setup_service,
-    ))
+        session_manager: session_manager_service,
+        screenreader_setup: screenreader_setup_service,
+        cecd: cecd_service,
+    })
 }
 
 #[cfg(test)]
@@ -1830,9 +1839,11 @@ mod test {
     use crate::{path, testing};
 
     use anyhow::{anyhow, bail, ensure};
+    use linux_cec::VendorId;
     use std::num::{NonZero, NonZeroU32};
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::str::FromStr;
     use std::time::Duration;
     use tokio::fs::{create_dir_all, set_permissions, write};
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -1872,7 +1883,7 @@ mod test {
             TestConfig {
                 platform: all_platform_config(),
                 device: all_device_config(),
-                setup: NopTestSetup::default(),
+                setup: NopTestSetup,
             }
         }
 
@@ -1880,7 +1891,7 @@ mod test {
             TestConfig {
                 platform: None,
                 device: None,
-                setup: NopTestSetup::default(),
+                setup: NopTestSetup,
             }
         }
     }
@@ -1890,7 +1901,7 @@ mod test {
             TestConfig {
                 platform: None,
                 device: None,
-                setup: setup,
+                setup,
             }
         }
     }
@@ -1918,7 +1929,7 @@ mod test {
                 device: String::from("steam_deck"),
                 variant: String::from("Galileo"),
                 friendly_name: Some(String::from("Steam Deck")),
-                oui: Some(String::from("E0-31-9E")),
+                oui: Some(VendorId::from_str("E0-31-9E").unwrap()),
             }],
             tdp_limit: Some(TdpLimitConfig {
                 method: TdpLimitingMethod::AmdgpuHwmon,
@@ -1952,6 +1963,7 @@ mod test {
                 suggested_default: String::from("balanced"),
             }),
             inputplumber: None,
+            cec_hw: None,
         })
     }
 
@@ -2024,7 +2036,7 @@ mod test {
         crate::gpu::test::create_nodes().await?;
         crate::power::test::create_nodes().await?;
 
-        config.setup.setup(&mut handle, &connection).await?;
+        config.setup.setup(&handle, &connection).await?;
 
         create_interfaces(
             connection.clone(),
@@ -2037,11 +2049,10 @@ mod test {
 
         tokio::spawn(async move {
             while let Some(command) = rx_ctx.recv().await {
-                match command {
-                    DaemonCommand::ContextCommand(UserCommand::GetSessionManagerState(sender)) => {
-                        _ = sender.send(SessionManagerState::default())
-                    }
-                    _ => (),
+                if let DaemonCommand::ContextCommand(UserCommand::GetSessionManagerState(sender)) =
+                    command
+                {
+                    _ = sender.send(SessionManagerState::default())
                 }
             }
             Ok::<_, Error>(())
@@ -2148,7 +2159,7 @@ mod test {
         let test = start(TestConfig {
             platform: Some(config),
             device: None,
-            setup: NopTestSetup::default(),
+            setup: NopTestSetup,
         })
         .await
         .expect("start");
@@ -2166,7 +2177,7 @@ mod test {
         let test = start(TestConfig {
             platform: Some(config),
             device: None,
-            setup: NopTestSetup::default(),
+            setup: NopTestSetup,
         })
         .await
         .expect("start");
@@ -2383,7 +2394,7 @@ mod test {
         let test = start(TestConfig {
             platform: Some(config),
             device: all_device_config(),
-            setup: NopTestSetup::default(),
+            setup: NopTestSetup,
         })
         .await
         .expect("start");
@@ -2394,13 +2405,15 @@ mod test {
     #[tokio::test]
     async fn interface_missing_invalid_format_storage1() {
         let mut config = all_platform_config().unwrap();
-        let mut format_config = FormatDeviceConfig::default();
-        format_config.script = PathBuf::from("oxo");
+        let format_config = FormatDeviceConfig {
+            script: PathBuf::from("oxo"),
+            ..FormatDeviceConfig::default()
+        };
         config.storage.as_mut().unwrap().format_device = format_config;
         let test = start(TestConfig {
             platform: Some(config),
             device: all_device_config(),
-            setup: NopTestSetup::default(),
+            setup: NopTestSetup,
         })
         .await
         .expect("start");
@@ -2436,7 +2449,7 @@ mod test {
         let test = start(TestConfig {
             platform: Some(config),
             device: all_device_config(),
-            setup: NopTestSetup::default(),
+            setup: NopTestSetup,
         })
         .await
         .expect("start");
@@ -2472,7 +2485,7 @@ mod test {
         let test = start(TestConfig {
             platform: Some(config),
             device: all_device_config(),
-            setup: NopTestSetup::default(),
+            setup: NopTestSetup,
         })
         .await
         .expect("start");
@@ -2568,7 +2581,7 @@ mod test {
         test: &TestHandle<S>,
         new_conn: &Connection,
     ) -> Result<()> {
-        let proxy = RemoteInterface1Proxy::builder(&new_conn)
+        let proxy = RemoteInterface1Proxy::builder(new_conn)
             .destination(
                 test.connection
                     .unique_name()
@@ -2984,7 +2997,7 @@ mod test {
 
         #[zbus(property(emits_changed_signal = "const"))]
         async fn suggested_minimum_limit(&self) -> i32 {
-            return BATTERY_DEFAULT_SUGGESTED_MINIMUM_LIMIT;
+            BATTERY_DEFAULT_SUGGESTED_MINIMUM_LIMIT
         }
     }
 
@@ -3155,19 +3168,21 @@ mod test {
 
     #[tokio::test]
     async fn remote_tdp_limit1_relay_download_mode() {
-        let mut device = DeviceConfig::default();
-        device.tdp_limit = Some(TdpLimitConfig {
-            method: TdpLimitingMethod::RemoteInterface,
-            range: None,
-            download_mode_limit: Some(NonZero::new(5).unwrap()),
-            firmware_attribute: None,
-            performance_profile: None,
-            acpi_call_alib: None,
-        });
+        let device = DeviceConfig {
+            tdp_limit: Some(TdpLimitConfig {
+                method: TdpLimitingMethod::RemoteInterface,
+                range: None,
+                download_mode_limit: Some(NonZero::new(5).unwrap()),
+                firmware_attribute: None,
+                performance_profile: None,
+                acpi_call_alib: None,
+            }),
+            ..DeviceConfig::default()
+        };
         let mut test = start(TestConfig {
             platform: None,
             device: Some(device),
-            setup: NopTestSetup::default(),
+            setup: NopTestSetup,
         })
         .await
         .unwrap();

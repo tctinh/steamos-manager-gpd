@@ -6,6 +6,7 @@
  */
 
 use anyhow::{Result, bail, ensure};
+use linux_cec::VendorId;
 use num_enum::TryFromPrimitive;
 use serde::Deserialize;
 use std::io::ErrorKind;
@@ -19,6 +20,7 @@ use tokio::sync::OnceCell;
 use tracing::{debug, error};
 use zbus::Connection;
 
+use crate::cec::HdmiCecHardware;
 use crate::gpu::{GpuPerformanceLevelDriverType, GpuPowerProfileDriverType};
 use crate::path;
 use crate::platform::{ServiceConfig, platform_config};
@@ -89,6 +91,7 @@ pub(crate) struct DeviceConfig {
     pub battery_charge_limit: Option<BatteryChargeLimitConfig>,
     pub performance_profile: Option<PerformanceProfileConfig>,
     pub inputplumber: Option<InputPlumberConfig>,
+    pub cec_hw: Option<HdmiCecConfig>,
 }
 
 #[derive(Clone, Default, Deserialize, Debug)]
@@ -104,7 +107,7 @@ pub(crate) struct DeviceMatch {
     pub device: String,
     pub variant: String,
     pub friendly_name: Option<String>,
-    pub oui: Option<String>,
+    pub oui: Option<VendorId>,
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -147,6 +150,12 @@ pub(crate) struct GpuPerformanceConfig {
 #[derive(Clone, Deserialize, Debug)]
 pub(crate) struct GpuPowerProfileConfig {
     pub driver: GpuPowerProfileDriverType,
+}
+
+#[derive(Clone, Default, Deserialize, Debug)]
+#[serde(default)]
+pub(crate) struct HdmiCecConfig {
+    pub hardware: Option<HdmiCecHardware>,
 }
 
 #[derive(Clone, Deserialize, Debug, Default)]
@@ -372,7 +381,7 @@ impl FanControl {
         let base = find_hwmon(&config.hwmon).await?;
         let path = base.join(&config.attribute);
         debug!("Writing fan speed {rpm} to {}", path.display());
-        write_synced(path, rpm.to_string().as_bytes()).await
+        Ok(write_synced(path, rpm.to_string().as_bytes()).await?)
     }
 }
 
@@ -851,10 +860,12 @@ pub mod test {
 
         sleep(Duration::from_millis(10)).await;
 
-        let mut platform_config = PlatformConfig::default();
-        platform_config.fan_control = Some(ServiceConfig::Systemd(String::from(
-            "jupiter-fan-control.service",
-        )));
+        let platform_config = PlatformConfig {
+            fan_control: Some(ServiceConfig::Systemd(String::from(
+                "jupiter-fan-control.service",
+            ))),
+            ..PlatformConfig::default()
+        };
         h.test.set_platform_config(platform_config).await;
 
         let fan_control = FanControl::new(connection);
@@ -876,12 +887,14 @@ pub mod test {
         let mut h = testing::start();
         let connection = h.new_dbus().await.expect("dbus");
 
-        let mut config = DeviceConfig::default();
-        config.fan_speed = Some(FanSpeedConfig {
-            hwmon: String::from("steamdeck_hwmon"),
-            attribute: String::from("fan1_target"),
-            download_mode_fan_speed: None,
-        });
+        let config = DeviceConfig {
+            fan_speed: Some(FanSpeedConfig {
+                hwmon: String::from("steamdeck_hwmon"),
+                attribute: String::from("fan1_target"),
+                download_mode_fan_speed: None,
+            }),
+            ..DeviceConfig::default()
+        };
         h.test.set_device_config(config).await;
 
         let base = path(crate::power::HWMON_PREFIX).join(STEAMDECK_HWMON);

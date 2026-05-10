@@ -455,9 +455,9 @@ pub(crate) async fn set_cpu_boost_state(state: CPUBoostState) -> Result<()> {
         (CpuBoostDriver::IntelPstate, CPUBoostState::Enabled) => "0",
         (CpuBoostDriver::IntelPstate, CPUBoostState::Disabled) => "1",
     };
-    write_synced(path, contents.as_bytes())
+    Ok(write_synced(path, contents.as_bytes())
         .await
-        .inspect_err(|message| error!("Error writing to CPU boost sysfs file: {message}"))
+        .inspect_err(|message| error!("Error writing to CPU boost sysfs file: {message}"))?)
 }
 
 pub(crate) async fn find_hwmon(hwmon: &str) -> Result<PathBuf> {
@@ -681,7 +681,8 @@ impl TdpLimitManager for FirmwareAttributeLimitManager {
             fppt_value.to_string().as_bytes(),
         )
         .await
-        .inspect_err(|message| error!("Error writing to sysfs file: {message}"))
+        .inspect_err(|message| error!("Error writing to sysfs file: {message}"))?;
+        Ok(())
     }
 
     async fn get_tdp_limit_range(&self) -> Result<RangeInclusive<u32>> {
@@ -1215,15 +1216,17 @@ pub(crate) mod test {
         let mut handle = testing::start();
         let connection = handle.new_dbus().await.expect("new_dbus");
 
-        let mut config = DeviceConfig::default();
-        config.tdp_limit = Some(TdpLimitConfig {
-            method: TdpLimitingMethod::AmdgpuHwmon,
-            range: Some(RangeConfig { min: 3, max: 15 }),
-            download_mode_limit: None,
-            firmware_attribute: None,
-            performance_profile: None,
-            acpi_call_alib: None,
-        });
+        let config = DeviceConfig {
+            tdp_limit: Some(TdpLimitConfig {
+                method: TdpLimitingMethod::AmdgpuHwmon,
+                range: Some(RangeConfig { min: 3, max: 15 }),
+                download_mode_limit: None,
+                firmware_attribute: None,
+                performance_profile: None,
+                acpi_call_alib: None,
+            }),
+            ..DeviceConfig::default()
+        };
         handle.test.set_device_config(config).await;
         let manager = tdp_limit_manager(&connection).await.unwrap();
 
@@ -1243,15 +1246,17 @@ pub(crate) mod test {
         let mut handle = testing::start();
         let connection = handle.new_dbus().await.expect("new_dbus");
 
-        let mut config = DeviceConfig::default();
-        config.tdp_limit = Some(TdpLimitConfig {
-            method: TdpLimitingMethod::AmdgpuHwmon,
-            range: Some(RangeConfig { min: 3, max: 15 }),
-            download_mode_limit: None,
-            firmware_attribute: None,
-            performance_profile: None,
-            acpi_call_alib: None,
-        });
+        let config = DeviceConfig {
+            tdp_limit: Some(TdpLimitConfig {
+                method: TdpLimitingMethod::AmdgpuHwmon,
+                range: Some(RangeConfig { min: 3, max: 15 }),
+                download_mode_limit: None,
+                firmware_attribute: None,
+                performance_profile: None,
+                acpi_call_alib: None,
+            }),
+            ..DeviceConfig::default()
+        };
         handle.test.set_device_config(config).await;
         let manager = tdp_limit_manager(&connection).await.unwrap();
 
@@ -1488,11 +1493,13 @@ pub(crate) mod test {
     async fn read_max_charge_level_acpi_sb() {
         let handle = testing::start();
 
-        let mut config = DeviceConfig::default();
-        config.battery_charge_limit = Some(BatteryChargeLimitConfig {
-            suggested_minimum_limit: 10,
-            method: BatteryChargeLimitMethod::AcpiSb,
-        });
+        let config = DeviceConfig {
+            battery_charge_limit: Some(BatteryChargeLimitConfig {
+                suggested_minimum_limit: 10,
+                method: BatteryChargeLimitMethod::AcpiSb,
+            }),
+            ..DeviceConfig::default()
+        };
         handle.test.set_device_config(config).await;
 
         let base = path(SB_PATH).join("BAT1");
@@ -1525,14 +1532,16 @@ pub(crate) mod test {
     async fn read_max_charge_level_hwmmon() {
         let handle = testing::start();
 
-        let mut config = DeviceConfig::default();
-        config.battery_charge_limit = Some(BatteryChargeLimitConfig {
-            suggested_minimum_limit: 10,
-            method: BatteryChargeLimitMethod::HwmonAttribute {
-                hwmon: String::from("steamdeck_hwmon"),
-                attribute: String::from("max_battery_charge_level"),
-            },
-        });
+        let config = DeviceConfig {
+            battery_charge_limit: Some(BatteryChargeLimitConfig {
+                suggested_minimum_limit: 10,
+                method: BatteryChargeLimitMethod::HwmonAttribute {
+                    hwmon: String::from("steamdeck_hwmon"),
+                    attribute: String::from("max_battery_charge_level"),
+                },
+            }),
+            ..DeviceConfig::default()
+        };
         handle.test.set_device_config(config).await;
 
         let base = path(HWMON_PREFIX).join("hwmon6");
@@ -1676,15 +1685,17 @@ pub(crate) mod test {
 
         let iface = MockTdpLimit { queue: reply_tx };
 
-        let mut config = DeviceConfig::default();
-        config.tdp_limit = Some(TdpLimitConfig {
-            method: TdpLimitingMethod::AmdgpuHwmon,
-            range: Some(RangeConfig { min: 3, max: 15 }),
-            download_mode_limit: NonZeroU32::new(6),
-            firmware_attribute: None,
-            performance_profile: None,
-            acpi_call_alib: None,
-        });
+        let config = DeviceConfig {
+            tdp_limit: Some(TdpLimitConfig {
+                method: TdpLimitingMethod::AmdgpuHwmon,
+                range: Some(RangeConfig { min: 3, max: 15 }),
+                download_mode_limit: NonZeroU32::new(6),
+                firmware_attribute: None,
+                performance_profile: None,
+                acpi_call_alib: None,
+            }),
+            ..DeviceConfig::default()
+        };
         h.test.set_device_config(config).await;
         let manager = tdp_limit_manager(&connection).await.unwrap();
 
@@ -1779,20 +1790,22 @@ pub(crate) mod test {
             fan_control_state: FanControlState::Os as u32,
         };
 
-        let mut config = DeviceConfig::default();
-        config.tdp_limit = Some(TdpLimitConfig {
-            method: TdpLimitingMethod::AmdgpuHwmon,
-            range: Some(RangeConfig { min: 3, max: 15 }),
-            download_mode_limit: NonZeroU32::new(6),
-            firmware_attribute: None,
-            performance_profile: None,
-            acpi_call_alib: None,
-        });
-        config.fan_speed = Some(FanSpeedConfig {
-            hwmon: String::from("steamdeck_hwmon"),
-            attribute: String::from("fan1_target"),
-            download_mode_fan_speed: NonZeroU32::new(2000),
-        });
+        let config = DeviceConfig {
+            tdp_limit: Some(TdpLimitConfig {
+                method: TdpLimitingMethod::AmdgpuHwmon,
+                range: Some(RangeConfig { min: 3, max: 15 }),
+                download_mode_limit: NonZeroU32::new(6),
+                firmware_attribute: None,
+                performance_profile: None,
+                acpi_call_alib: None,
+            }),
+            fan_speed: Some(FanSpeedConfig {
+                hwmon: String::from("steamdeck_hwmon"),
+                attribute: String::from("fan1_target"),
+                download_mode_fan_speed: NonZeroU32::new(2000),
+            }),
+            ..DeviceConfig::default()
+        };
         h.test.set_device_config(config).await;
 
         connection
@@ -1860,15 +1873,17 @@ pub(crate) mod test {
 
         let iface = MockTdpLimit { queue: reply_tx };
 
-        let mut config = DeviceConfig::default();
-        config.tdp_limit = Some(TdpLimitConfig {
-            method: TdpLimitingMethod::AmdgpuHwmon,
-            range: Some(RangeConfig { min: 3, max: 15 }),
-            download_mode_limit: None,
-            firmware_attribute: None,
-            performance_profile: None,
-            acpi_call_alib: None,
-        });
+        let config = DeviceConfig {
+            tdp_limit: Some(TdpLimitConfig {
+                method: TdpLimitingMethod::AmdgpuHwmon,
+                range: Some(RangeConfig { min: 3, max: 15 }),
+                download_mode_limit: None,
+                firmware_attribute: None,
+                performance_profile: None,
+                acpi_call_alib: None,
+            }),
+            ..DeviceConfig::default()
+        };
         h.test.set_device_config(config).await;
         let manager = tdp_limit_manager(&connection).await.unwrap();
 
@@ -1925,22 +1940,24 @@ pub(crate) mod test {
         setup().await.expect("setup");
 
         let connection = h.new_dbus().await.expect("new_dbus");
-        let mut config = DeviceConfig::default();
-        config.performance_profile = Some(PerformanceProfileConfig {
-            platform_profile_name: String::from("platform-profile0"),
-            suggested_default: String::from("custom"),
-        });
-        config.tdp_limit = Some(TdpLimitConfig {
-            method: TdpLimitingMethod::FirmwareAttribute,
-            range: Some(RangeConfig { min: 3, max: 15 }),
-            download_mode_limit: None,
-            firmware_attribute: Some(FirmwareAttributeConfig {
-                attribute: String::from("tdp0"),
-                performance_profile: Some(String::from("custom")),
+        let config = DeviceConfig {
+            performance_profile: Some(PerformanceProfileConfig {
+                platform_profile_name: String::from("platform-profile0"),
+                suggested_default: String::from("custom"),
             }),
-            performance_profile: None,
-            acpi_call_alib: None,
-        });
+            tdp_limit: Some(TdpLimitConfig {
+                method: TdpLimitingMethod::FirmwareAttribute,
+                range: Some(RangeConfig { min: 3, max: 15 }),
+                download_mode_limit: None,
+                firmware_attribute: Some(FirmwareAttributeConfig {
+                    attribute: String::from("tdp0"),
+                    performance_profile: Some(String::from("custom")),
+                }),
+                performance_profile: None,
+                acpi_call_alib: None,
+            }),
+            ..DeviceConfig::default()
+        };
         h.test.set_device_config(config).await;
 
         let attributes_base = path(FirmwareAttributeLimitManager::PREFIX)
@@ -1986,7 +2003,7 @@ pub(crate) mod test {
 
         let manager = tdp_limit_manager(&connection).await.unwrap();
 
-        assert_eq!(manager.is_active().await.unwrap(), true);
+        assert!(manager.is_active().await.unwrap());
         assert_eq!(manager.get_tdp_limit().await.unwrap(), 10);
 
         manager.set_tdp_limit(15).await.unwrap();
@@ -2050,18 +2067,20 @@ pub(crate) mod test {
         setup().await.expect("setup");
 
         let connection = h.new_dbus().await.expect("new_dbus");
-        let mut config = DeviceConfig::default();
-        config.tdp_limit = Some(TdpLimitConfig {
-            method: TdpLimitingMethod::FirmwareAttribute,
-            range: Some(RangeConfig { min: 3, max: 15 }),
-            download_mode_limit: None,
-            firmware_attribute: Some(FirmwareAttributeConfig {
-                attribute: String::from("tdp0"),
+        let config = DeviceConfig {
+            tdp_limit: Some(TdpLimitConfig {
+                method: TdpLimitingMethod::FirmwareAttribute,
+                range: Some(RangeConfig { min: 3, max: 15 }),
+                download_mode_limit: None,
+                firmware_attribute: Some(FirmwareAttributeConfig {
+                    attribute: String::from("tdp0"),
+                    performance_profile: None,
+                }),
                 performance_profile: None,
+                acpi_call_alib: None,
             }),
-            performance_profile: None,
-            acpi_call_alib: None,
-        });
+            ..DeviceConfig::default()
+        };
         h.test.set_device_config(config).await;
 
         let attributes_base = path(FirmwareAttributeLimitManager::PREFIX)
@@ -2098,7 +2117,7 @@ pub(crate) mod test {
 
         let manager = tdp_limit_manager(&connection).await.unwrap();
 
-        assert_eq!(manager.is_active().await.unwrap(), true);
+        assert!(manager.is_active().await.unwrap());
         assert_eq!(manager.get_tdp_limit().await.unwrap(), 10);
 
         manager.set_tdp_limit(15).await.unwrap();

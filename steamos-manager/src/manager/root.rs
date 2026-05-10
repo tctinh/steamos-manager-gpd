@@ -19,6 +19,7 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{self, Fd};
 use zbus::{Connection, fdo, interface, proxy};
 
+use crate::cec::{HdmiCecHwController, cec_hw_controller};
 use crate::daemon::DaemonCommand;
 use crate::daemon::root::{Command, RootCommand};
 use crate::error::{to_zbus_error, to_zbus_fdo_error};
@@ -69,6 +70,7 @@ pub struct SteamOSManager {
     should_trace: bool,
     job_manager: JobManager,
     cpu_scheduler_manager: CpuSchedulerManager<'static>,
+    cec_hw: Option<Box<dyn HdmiCecHwController>>,
 }
 
 impl SteamOSManager {
@@ -92,6 +94,10 @@ impl SteamOSManager {
                 == SteamDeckVariant::Galileo,
             job_manager: JobManager::new(connection.clone()).await?,
             cpu_scheduler_manager: CpuSchedulerManager::new(&connection).await?,
+            cec_hw: cec_hw_controller()
+                .await
+                .inspect_err(|e| info!("Could not set up HDMI CEC hardware controller: {e}"))
+                .ok(),
             connection,
             channel,
             order: SerialOrderValidator::default(),
@@ -110,10 +116,23 @@ pub(crate) trait RootManager {
     fn set_default_session(&self, session: &str) -> zbus::Result<()>;
     fn set_fan_speed(&self, rpm: u32) -> zbus::Result<()>;
 
-    #[zbus(property(emits_changed_signal = "false"))]
+    #[zbus(property)]
     fn fan_control_state(&self) -> zbus::Result<u32>;
     #[zbus(property)]
     fn set_fan_control_state(&self, state: u32) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn hdmi_cec_can_awaken(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn hdmi_cec_awaken(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn set_hdmi_cec_awaken(&self, awaken: bool) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn hdmi_cec_phys_addr(&self) -> zbus::Result<u16>;
+    #[zbus(property)]
+    fn set_hdmi_cec_phys_addr(&self, phys_addr: u16) -> zbus::Result<()>;
 }
 
 #[interface(name = "com.steampowered.SteamOSManager1.RootManager", spawn = false)]
@@ -157,7 +176,7 @@ impl SteamOSManager {
             .map_err(to_zbus_fdo_error)
     }
 
-    #[zbus(property(emits_changed_signal = "false"))]
+    #[zbus(property)]
     async fn fan_control_state(&self) -> fdo::Result<u32> {
         Ok(self
             .fan_control
@@ -167,7 +186,11 @@ impl SteamOSManager {
     }
 
     #[zbus(property)]
-    async fn set_fan_control_state(&self, state: u32) -> zbus::Result<()> {
+    async fn set_fan_control_state(
+        &self,
+        state: u32,
+        #[zbus(signal_emitter)] ctx: SignalEmitter<'_>,
+    ) -> zbus::Result<()> {
         let state = match FanControlState::try_from(state) {
             Ok(state) => state,
             Err(err) => return Err(fdo::Error::InvalidArgs(err.to_string()).into()),
@@ -176,7 +199,8 @@ impl SteamOSManager {
         self.fan_control
             .set_state(state)
             .await
-            .map_err(to_zbus_error)
+            .map_err(to_zbus_error)?;
+        self.fan_control_state_changed(&ctx).await
     }
 
     async fn set_fan_speed(&self, rpm: u32) -> fdo::Result<()> {
@@ -370,13 +394,19 @@ impl SteamOSManager {
             .map_err(to_zbus_fdo_error)
     }
 
-    async fn set_cpu_scheduler(&mut self, scheduler: String) -> fdo::Result<()> {
+    #[zbus(property)]
+    async fn set_cpu_scheduler(
+        &mut self,
+        scheduler: String,
+        #[zbus(signal_emitter)] ctx: SignalEmitter<'_>,
+    ) -> fdo::Result<()> {
         let s = CpuScheduler::try_from(scheduler.as_str()).map_err(to_zbus_fdo_error)?;
         self.cpu_scheduler_manager
             .set_cpu_scheduler(s)
             .await
             .inspect_err(|message| error!("Error setting CPU scheduler: {message}"))
-            .map_err(to_zbus_fdo_error)
+            .map_err(to_zbus_fdo_error)?;
+        Ok(self.cpu_scheduler_changed(&ctx).await?)
     }
 
     async fn set_cpu_boost_state(&self, state: u32) -> fdo::Result<()> {
@@ -476,7 +506,7 @@ impl SteamOSManager {
         };
 
         if self.wifi_debug_mode == wanted_mode {
-            info!("Not changing wifi debug mode since it's already set to {wanted_mode}");
+            debug!("Not changing wifi debug mode since it's already set to {wanted_mode}");
             return Ok(());
         }
 
@@ -638,6 +668,63 @@ impl SteamOSManager {
     async fn clean_temporary_sessions(&self) -> fdo::Result<()> {
         clean_temporary_sessions().await.map_err(to_zbus_fdo_error)
     }
+
+    #[zbus(property)]
+    async fn hdmi_cec_can_awaken(&self) -> fdo::Result<bool> {
+        let Some(cec_hw) = self.cec_hw.as_ref() else {
+            return Ok(false);
+        };
+        cec_hw.can_awaken().await.map_err(to_zbus_fdo_error)
+    }
+
+    #[zbus(property)]
+    async fn hdmi_cec_awaken(&self) -> fdo::Result<bool> {
+        let cec_hw = self.cec_hw.as_ref().ok_or(fdo::Error::Failed(String::from(
+            "No HDMI CEC hardware configured",
+        )))?;
+        cec_hw.get_awaken().await.map_err(to_zbus_fdo_error)
+    }
+
+    #[zbus(property)]
+    async fn set_hdmi_cec_awaken(
+        &self,
+        awaken: bool,
+        #[zbus(signal_emitter)] ctx: SignalEmitter<'_>,
+    ) -> zbus::Result<()> {
+        let cec_hw = self.cec_hw.as_ref().ok_or(fdo::Error::Failed(String::from(
+            "No HDMI CEC hardware configured",
+        )))?;
+        cec_hw.set_awaken(awaken).await.map_err(to_zbus_error)?;
+        self.hdmi_cec_awaken_changed(&ctx).await
+    }
+
+    #[zbus(property)]
+    async fn hdmi_cec_phys_addr(&self) -> fdo::Result<u16> {
+        let cec_hw = self.cec_hw.as_ref().ok_or(fdo::Error::Failed(String::from(
+            "No HDMI CEC hardware configured",
+        )))?;
+        Ok(cec_hw
+            .get_phys_addr()
+            .await
+            .map_err(to_zbus_fdo_error)?
+            .into())
+    }
+
+    #[zbus(property)]
+    async fn set_hdmi_cec_phys_addr(
+        &self,
+        phys_addr: u16,
+        #[zbus(signal_emitter)] ctx: SignalEmitter<'_>,
+    ) -> zbus::Result<()> {
+        let cec_hw = self.cec_hw.as_ref().ok_or(fdo::Error::Failed(String::from(
+            "No HDMI CEC hardware configured",
+        )))?;
+        cec_hw
+            .set_phys_addr(phys_addr.into())
+            .await
+            .map_err(to_zbus_error)?;
+        self.hdmi_cec_phys_addr_changed(&ctx).await
+    }
 }
 
 #[cfg(test)]
@@ -702,8 +789,10 @@ mod test {
     async fn prepare_factory_reset() {
         let test = start().await.expect("start");
 
-        let mut config = PlatformConfig::default();
-        config.factory_reset = Some(ResetConfig::default());
+        let config = PlatformConfig {
+            factory_reset: Some(ResetConfig::default()),
+            ..PlatformConfig::default()
+        };
         test.h.test.set_platform_config(config).await;
 
         let name = test.connection.unique_name().unwrap();

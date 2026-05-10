@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use itertools::Itertools;
 use nix::time::{ClockId, clock_gettime};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, stderr};
 use std::path::PathBuf;
 use steamos_manager::audio::Mode;
@@ -391,21 +391,21 @@ async fn get_all_properties(conn: &Connection) -> Result<()> {
     )
     .await?;
 
-    let mut properties = HashMap::new();
+    let mut properties = BTreeMap::new();
     for interface in introspection.interfaces() {
-        let name = match interface.name() {
-            name if name
-                .as_str()
-                .starts_with("com.steampowered.SteamOSManager1") =>
-            {
-                name
-            }
-            _ => continue,
+        let fq_name = interface.name();
+        let Some(name) = fq_name.strip_prefix("com.steampowered.SteamOSManager1.") else {
+            continue;
         };
-        properties.extend(properties_proxy.get_all(name).await?);
+        properties.extend(
+            properties_proxy
+                .get_all(fq_name.clone())
+                .await?
+                .into_iter()
+                .map(|(k, v)| (format!("{name}.{k}"), v)),
+        );
     }
-    for key in properties.keys().sorted() {
-        let value = &properties[key];
+    for (key, value) in properties.iter() {
         let val = &**value;
         println!("{key}: {val}");
     }

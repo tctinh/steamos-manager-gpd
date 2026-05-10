@@ -521,11 +521,11 @@ pub mod test {
         ) -> fdo::Result<Vec<(String, String, String)>> {
             let mut res = Vec::new();
             for file in files {
-                if let Some(state) = self.states.get(&file) {
-                    if *state == EnableState::Masked {
-                        self.states.remove(&file);
-                        res.push((String::default(), String::default(), file.to_string()));
-                    }
+                if let Some(state) = self.states.get(&file)
+                    && *state == EnableState::Masked
+                {
+                    self.states.remove(&file);
+                    res.push((String::default(), String::default(), file.to_string()));
                 }
             }
             Ok(res)
@@ -556,9 +556,11 @@ pub mod test {
     #[tokio::test]
     async fn test_unit() {
         let mut h = testing::start();
-        let mut unit = MockUnit::default();
-        unit.active = String::from("inactive");
-        unit.unit_file = String::from("disabled");
+        let unit = MockUnit {
+            active: String::from("inactive"),
+            unit_file: String::from("disabled"),
+            ..MockUnit::default()
+        };
         let connection = h.new_dbus().await.expect("dbus");
         connection
             .request_name("org.freedesktop.systemd1")
@@ -612,9 +614,11 @@ pub mod test {
     #[tokio::test]
     async fn test_manager() {
         let mut h = testing::start();
-        let mut unit = MockUnit::default();
-        unit.active = String::from("active");
-        unit.unit_file = String::from("enabled");
+        let unit = MockUnit {
+            active: String::from("active"),
+            unit_file: String::from("enabled"),
+            ..MockUnit::default()
+        };
         let connection = h.new_dbus().await.expect("dbus");
         connection
             .request_name("org.freedesktop.systemd1")

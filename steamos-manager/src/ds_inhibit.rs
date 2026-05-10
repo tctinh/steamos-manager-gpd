@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use inotify::{Event, EventMask, EventStream, Inotify, WatchDescriptor, WatchMask};
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs::{self, read_dir, read_link};
@@ -41,7 +42,7 @@ impl HidNode {
         path(format!("/dev/hidraw{}", self.id))
     }
 
-    async fn get_nodes(&self) -> Result<Vec<PathBuf>> {
+    async fn get_nodes(&self) -> std::io::Result<Vec<PathBuf>> {
         let mut entries = Vec::new();
         let mut dir = read_dir(self.sys_base().join("input")).await?;
         while let Some(entry) = dir.next_entry().await? {
@@ -144,7 +145,7 @@ impl HidNode {
         Ok(())
     }
 
-    async fn inhibit(&self) -> Result<()> {
+    async fn inhibit(&self) -> std::io::Result<()> {
         let mut res = Ok(());
         for node in self.get_nodes().await? {
             if let Err(err) = write_synced(node, b"1\n").await {
@@ -155,12 +156,16 @@ impl HidNode {
         res
     }
 
-    async fn uninhibit(&self) -> Result<()> {
+    async fn uninhibit(&self) -> std::io::Result<()> {
         let mut res = Ok(());
         for node in self.get_nodes().await? {
             if let Err(err) = write_synced(node, b"0\n").await {
-                error!("Encountered error inhibiting: {err}");
-                res = Err(err);
+                if err.kind() == ErrorKind::NotFound {
+                    debug!("Node disappeared before uninhibiting");
+                } else {
+                    error!("Encountered error uninhibiting: {err}");
+                    res = Err(err);
+                }
             }
         }
         res
@@ -285,14 +290,14 @@ impl Service for Inhibitor {
         for (wd, node) in self.watches.drain() {
             if let Err(e) = self.inotify.watches().remove(wd) {
                 warn!("Error removing watch while shutting down: {e}");
-                res = Err(e.into());
+                res = Err(e);
             }
             if let Err(e) = node.uninhibit().await {
                 warn!("Error uninhibiting {} while shutting down: {e}", node.id);
                 res = Err(e);
             }
         }
-        res
+        Ok(res?)
     }
 }
 
