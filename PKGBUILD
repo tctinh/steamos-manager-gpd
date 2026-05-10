@@ -14,10 +14,8 @@ depends=(
   'systemd-libs'
   'dbus'
   'tuned'
-)
-optdepends=(
-  'acpi_call-dkms: Required for GPD Win Mini TDP control via ACPI/ALIB'
-  'tuned-ppd: Map KDE/GNOME power-profile selector onto the GPD tuned profiles (replaces power-profiles-daemon)'
+  'tuned-ppd'
+  'acpi_call-dkms'
 )
 makedepends=(
   'rust'
