@@ -2,7 +2,7 @@
 . /usr/lib/tuned/functions
 
 start() {
-    /usr/lib/steamos-manager/gpd-set-tdp 20 || return 1
+    /usr/lib/steamos-manager-gpd/gpd-set-tdp 20 || return 1
     return 0
 }
 

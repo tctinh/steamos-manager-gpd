@@ -46,7 +46,7 @@ install: target/release/steamos-manager target/release/steamosctl
 	install -m644 "data/user/steamos-manager-configure-cecd.service" "$(DESTDIR)/usr/lib/systemd/user/"
 	install -m644 "data/user/orca.service" "$(DESTDIR)/usr/lib/systemd/user/"
 
-	install -D -m755 "data/tuned/gpd-set-tdp.sh" "$(DESTDIR)/usr/lib/steamos-manager/gpd-set-tdp"
+	install -D -m755 "data/tuned/gpd-set-tdp.sh" "$(DESTDIR)/usr/lib/steamos-manager-gpd/gpd-set-tdp"
 
 	install -D -m644 "data/tuned/profiles/gpd-win-mini-power-saver/tuned.conf" \
 		"$(DESTDIR)/usr/lib/tuned/profiles/gpd-win-mini-power-saver/tuned.conf"
