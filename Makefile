@@ -45,3 +45,18 @@ install: target/release/steamos-manager target/release/steamosctl
 	install -m644 "data/user/steamos-manager-session-cleanup.service" "$(DESTDIR)/usr/lib/systemd/user/"
 	install -m644 "data/user/steamos-manager-configure-cecd.service" "$(DESTDIR)/usr/lib/systemd/user/"
 	install -m644 "data/user/orca.service" "$(DESTDIR)/usr/lib/systemd/user/"
+
+	install -D -m755 "data/tuned/gpd-set-tdp.sh" "$(DESTDIR)/usr/lib/steamos-manager/gpd-set-tdp"
+
+	install -D -m644 "data/tuned/profiles/gpd-win-mini-power-saver/tuned.conf" \
+		"$(DESTDIR)/usr/lib/tuned/profiles/gpd-win-mini-power-saver/tuned.conf"
+	install -D -m755 "data/tuned/profiles/gpd-win-mini-power-saver/script.sh" \
+		"$(DESTDIR)/usr/lib/tuned/profiles/gpd-win-mini-power-saver/script.sh"
+	install -D -m644 "data/tuned/profiles/gpd-win-mini-balanced/tuned.conf" \
+		"$(DESTDIR)/usr/lib/tuned/profiles/gpd-win-mini-balanced/tuned.conf"
+	install -D -m755 "data/tuned/profiles/gpd-win-mini-balanced/script.sh" \
+		"$(DESTDIR)/usr/lib/tuned/profiles/gpd-win-mini-balanced/script.sh"
+	install -D -m644 "data/tuned/profiles/gpd-win-mini-performance/tuned.conf" \
+		"$(DESTDIR)/usr/lib/tuned/profiles/gpd-win-mini-performance/tuned.conf"
+	install -D -m755 "data/tuned/profiles/gpd-win-mini-performance/script.sh" \
+		"$(DESTDIR)/usr/lib/tuned/profiles/gpd-win-mini-performance/script.sh"
